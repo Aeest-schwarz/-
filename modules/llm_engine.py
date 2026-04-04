@@ -1,4 +1,5 @@
-import json
+import re
+from collections import Counter
 from gigachat import GigaChat
 
 
@@ -12,14 +13,12 @@ class HRAnalyzer:
     def _expert_consensus_rate(self, hr_answers: list[str]) -> float:
         """
         Грубая оценка согласованности экспертов:
-        считаем долю ответов, которые содержат самое частое ключевое слово (3+ символов).
+        считаем долю экспертов, упомянувших самое частотное слово (3+ символов).
         Возвращает значение от 0.0 до 1.0.
         """
         if not hr_answers:
             return 0.0
 
-        # Токенизируем все ответы экспертов
-        from collections import Counter
         all_words = []
         for answer in hr_answers:
             words = [w.lower().strip(".,!?;:\"'()") for w in answer.split() if len(w) > 3]
@@ -29,9 +28,8 @@ class HRAnalyzer:
             return 0.0
 
         counter = Counter(all_words)
-        most_common_word, most_common_count = counter.most_common(1)[0]
+        most_common_word, _ = counter.most_common(1)[0]
 
-        # Сколько экспертов упомянули это слово хотя бы раз
         mentions = sum(
             1 for answer in hr_answers
             if most_common_word in answer.lower()
@@ -70,7 +68,7 @@ CLUSTERS:
 2) Название | Процент | Описание
 
 MATCH:
-[Только анализ совпадения ответа студента с позицией экспертов. Не повторяй вопрос и не цитируй ответ студента дословно.]
+[Только анализ совпадения ответа студента с позицией экспертов. Не добавляй заголовок "Совпадение с рынком". Не повторяй вопрос и не цитируй ответ студента дословно.]
 
 CRITIQUE:
 [Только критика и замечания по ответу студента. Не переходи в раздел GOLD.]
@@ -153,7 +151,7 @@ GOLD:
             " ".join(match_lines), question, student_answer
         )
 
-        # Фикс #3: если GOLD пустой, а CRITIQUE подозрительно длинный —
+        # Фикс: если GOLD пустой, а CRITIQUE подозрительно длинный —
         # последние 40% строк critique отдаём в gold
         if not gold_lines and len(critique_lines) > 4:
             split_at = int(len(critique_lines) * 0.6)
@@ -169,18 +167,24 @@ GOLD:
 
     def _sanitize_match(self, match_text: str, question: str, student_answer: str) -> str:
         """
-        Фикс #1: удаляем из поля MATCH случайно попавший вопрос
-        или дословный ответ студента.
+        Очищает поле MATCH от:
+        - фразы "Совпадение с рынком" в любом регистре и с любым разделителем
+        - случайно попавшего текста вопроса или ответа студента
         """
         if not match_text:
             return match_text
 
-        # Нормализуем для сравнения
+        # Убираем фразу "Совпадение с рынком" в любом регистре и с любым разделителем после
+        match_text = re.sub(
+            r'(?i)совпадение\s+с\s+рынком\s*[:\-–—]?\s*',
+            '',
+            match_text
+        ).strip()
+
         match_lower = match_text.lower().strip()
         question_lower = question.lower().strip()
         student_lower = student_answer.lower().strip()
 
-        # Если текст совпадения совпадает с вопросом или ответом студента > 80% — очищаем
         def overlap_ratio(a: str, b: str) -> float:
             if not a or not b:
                 return 0.0
@@ -191,10 +195,5 @@ GOLD:
             return ""
         if overlap_ratio(match_lower, student_lower) > 0.8:
             return ""
-
-        # Убираем строки, которые являются точной копией вопроса или ответа студента
-        cleaned_lines = []
-        for line in match_text.split(" "):
-            pass  # посимвольная очистка не нужна — работаем на уровне всего блока
 
         return match_text
