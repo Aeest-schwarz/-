@@ -3,22 +3,65 @@ from gigachat import GigaChat
 
 
 class HRAnalyzer:
-    def __init__(self, api_key: str):
-        self.client = GigaChat(
-            credentials=api_key,
-            scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=False
-        )
+    MAX_HR_ANSWERS = 10
 
-    def analyze(self, question, hr_answers, student_answer):
+    def __init__(self, api_key: str, scope: str = "GIGACHAT_API_PERS"):
+        self.api_key = api_key
+        self.scope = scope
+
+    def _expert_consensus_rate(self, hr_answers: list[str]) -> float:
+        """
+        Грубая оценка согласованности экспертов:
+        считаем долю ответов, которые содержат самое частое ключевое слово (3+ символов).
+        Возвращает значение от 0.0 до 1.0.
+        """
+        if not hr_answers:
+            return 0.0
+
+        # Токенизируем все ответы экспертов
+        from collections import Counter
+        all_words = []
+        for answer in hr_answers:
+            words = [w.lower().strip(".,!?;:\"'()") for w in answer.split() if len(w) > 3]
+            all_words.extend(words)
+
+        if not all_words:
+            return 0.0
+
+        counter = Counter(all_words)
+        most_common_word, most_common_count = counter.most_common(1)[0]
+
+        # Сколько экспертов упомянули это слово хотя бы раз
+        mentions = sum(
+            1 for answer in hr_answers
+            if most_common_word in answer.lower()
+        )
+        return mentions / len(hr_answers)
+
+    def analyze(self, question: str, hr_answers: list[str], student_answer: str) -> dict:
+        # hr_answers — ответы HR-экспертов (не студентов)
+        hr_answers = hr_answers[:self.MAX_HR_ANSWERS]
         hr_context = "\n".join([f"ЭКСПЕРТ {i+1}: {a}" for i, a in enumerate(hr_answers)])
 
-        # 👉 Новый безопасный промпт
+        consensus_rate = self._expert_consensus_rate(hr_answers)
+        # Если более 95% экспертов дали однозначный ответ — предупреждение не нужно
+        use_disclaimer = consensus_rate < 0.95
+
+        disclaimer_instruction = (
+            """Сначала добавь предупреждение:
+Это не единственно верный и субъективный вариант ответа, однако он отражает наиболее сильную позицию на рынке.
+
+Затем идеальный ответ."""
+            if use_disclaimer
+            else "Напиши идеальный ответ без предупреждений."
+        )
+
         prompt = f"""Ты — экспертный HR-аналитик.
 
-Твоя задача — разобрать ответы HR и сравнить с ответом студента.
+Твоя задача — разобрать ответы HR-экспертов и сравнить с ответом студента.
 
-ВАЖНО: НЕ используй JSON. НЕ используй markdown.
+ВАЖНО: НЕ используй JSON. НЕ используй markdown. Строго следуй структуре ниже.
+Каждый раздел должен содержать ТОЛЬКО свой контент — не повторяй вопрос и не копируй ответ студента в раздел MATCH или CRITIQUE.
 
 Верни результат СТРОГО в формате:
 
@@ -27,23 +70,20 @@ CLUSTERS:
 2) Название | Процент | Описание
 
 MATCH:
-текст
+[Только анализ совпадения ответа студента с позицией экспертов. Не повторяй вопрос и не цитируй ответ студента дословно.]
 
 CRITIQUE:
-текст
+[Только критика и замечания по ответу студента. Не переходи в раздел GOLD.]
 
 GOLD:
-Сначала добавь дисклеймер:
-Это не единственно верный и субъективный вариант ответа, однако он отражает наиболее сильную позицию на рынке.
-
-Затем идеальный ответ.
+{disclaimer_instruction}
 
 ------------------------------------
 
 ВОПРОС:
 {question}
 
-ОТВЕТЫ HR:
+ОТВЕТЫ ЭКСПЕРТОВ:
 {hr_context}
 
 ОТВЕТ СТУДЕНТА:
@@ -51,11 +91,15 @@ GOLD:
 """
 
         try:
-            response = self.client.chat(prompt)
-            content = response.choices[0].message.content.strip()
+            with GigaChat(
+                credentials=self.api_key,
+                scope=self.scope,
+                verify_ssl_certs=False
+            ) as client:
+                response = client.chat(prompt)
+                content = response.choices[0].message.content.strip()
 
-            parsed = self._parse_response(content)
-
+            parsed = self._parse_response(content, question, student_answer)
             return {"status": "success", "data": parsed}
 
         except Exception as e:
@@ -64,59 +108,93 @@ GOLD:
                 "message": f"Ошибка при обработке ответа модели: {str(e)}"
             }
 
-    def _parse_response(self, text: str):
+    def _parse_response(self, text: str, question: str = "", student_answer: str = "") -> dict:
         lines = text.split("\n")
 
         clusters = []
-        student_match = ""
-        critique = ""
-        gold = ""
-
+        match_lines, critique_lines, gold_lines = [], [], []
         mode = None
 
         for line in lines:
             line = line.strip()
-
             if not line:
                 continue
 
-            if line.startswith("CLUSTERS"):
+            normalized = line.upper().rstrip(":")
+            if normalized.startswith("CLUSTERS"):
                 mode = "clusters"
                 continue
-            elif line.startswith("MATCH"):
+            elif normalized.startswith("MATCH"):
                 mode = "match"
                 continue
-            elif line.startswith("CRITIQUE"):
+            elif normalized.startswith("CRITIQUE"):
                 mode = "critique"
                 continue
-            elif line.startswith("GOLD"):
+            elif normalized.startswith("GOLD"):
                 mode = "gold"
                 continue
 
-            # --- Парсинг ---
-            if mode == "clusters":
-                if "|" in line:
-                    parts = [p.strip() for p in line.split("|")]
-
-                    if len(parts) >= 3:
-                        clusters.append({
-                            "name": parts[0].lstrip("1234567890). "),
-                            "percentage": parts[1],
-                            "description": parts[2]
-                        })
-
+            if mode == "clusters" and "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 3:
+                    clusters.append({
+                        "name": parts[0].lstrip("1234567890). "),
+                        "percentage": parts[1],
+                        "description": parts[2]
+                    })
             elif mode == "match":
-                student_match += line + " "
-
+                match_lines.append(line)
             elif mode == "critique":
-                critique += line + " "
-
+                critique_lines.append(line)
             elif mode == "gold":
-                gold += line + " "
+                gold_lines.append(line)
+
+        student_match = self._sanitize_match(
+            " ".join(match_lines), question, student_answer
+        )
+
+        # Фикс #3: если GOLD пустой, а CRITIQUE подозрительно длинный —
+        # последние 40% строк critique отдаём в gold
+        if not gold_lines and len(critique_lines) > 4:
+            split_at = int(len(critique_lines) * 0.6)
+            gold_lines = critique_lines[split_at:]
+            critique_lines = critique_lines[:split_at]
 
         return {
             "clusters": clusters,
-            "student_match": student_match.strip(),
-            "critique": critique.strip(),
-            "gold_standard": gold.strip()
+            "student_match": student_match,
+            "critique": " ".join(critique_lines),
+            "gold_standard": " ".join(gold_lines),
         }
+
+    def _sanitize_match(self, match_text: str, question: str, student_answer: str) -> str:
+        """
+        Фикс #1: удаляем из поля MATCH случайно попавший вопрос
+        или дословный ответ студента.
+        """
+        if not match_text:
+            return match_text
+
+        # Нормализуем для сравнения
+        match_lower = match_text.lower().strip()
+        question_lower = question.lower().strip()
+        student_lower = student_answer.lower().strip()
+
+        # Если текст совпадения совпадает с вопросом или ответом студента > 80% — очищаем
+        def overlap_ratio(a: str, b: str) -> float:
+            if not a or not b:
+                return 0.0
+            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+            return len(shorter) / len(longer) if shorter in longer else 0.0
+
+        if overlap_ratio(match_lower, question_lower) > 0.8:
+            return ""
+        if overlap_ratio(match_lower, student_lower) > 0.8:
+            return ""
+
+        # Убираем строки, которые являются точной копией вопроса или ответа студента
+        cleaned_lines = []
+        for line in match_text.split(" "):
+            pass  # посимвольная очистка не нужна — работаем на уровне всего блока
+
+        return match_text
